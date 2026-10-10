@@ -34,6 +34,17 @@ def _add_controls(p: argparse.ArgumentParser) -> None:
     g.add_argument("--no-auto-mask", action="store_true", help="turn the automatic skin mask off")
 
 
+def _use_int4(args) -> None:
+    """Switch the int4 mixed network on or off before a network is built (it changes the weights the layers decode)."""
+    from . import int4
+
+    if args.int4:
+        int4.enable(args.int4_tables)
+        print(f"int4 mixed network, tables from {int4.tables.directory}", file=sys.stderr)
+    else:
+        int4.disable()
+
+
 def _enhance(args, frame):
     import torch
 
@@ -47,6 +58,7 @@ def _enhance(args, frame):
     label = torch.cuda.get_device_name(device) if device.type == "cuda" else "the CPU"
     height, width = frame.shape[:2]
     started = time.time()
+    _use_int4(args)
     weights = Weights.load(args.weights)
     net = NRNet(weights, width, height).to(device)
     print(f"network built for {width}x{height} on {label} in {time.time() - started:.1f} s", file=sys.stderr)
@@ -120,6 +132,7 @@ def cmd_benchmark(args) -> int:
         torch.set_num_threads(args.threads)
     device = resolve_device(args.device)
     label = torch.cuda.get_device_name(device) if device.type == "cuda" else f"the CPU ({torch.get_num_threads()} threads)"
+    _use_int4(args)
     weights = Weights.load(args.weights)
     controls = _controls(args)
     for size in args.size or ["1920x1080"]:
@@ -166,6 +179,11 @@ def main(argv: list[str] | None = None) -> int:
         q.add_argument("--device", default="auto",
                        help="auto (the GPU if PyTorch sees one, else the CPU), cpu, cuda or cuda:N")
         q.add_argument("--threads", type=int, default=0, help="CPU threads (0: PyTorch's default)")
+        q.add_argument("--int4", action="store_true",
+                       help="the int4 mixed network of DLSSNR-AMD (not NVIDIA's picture: about 42 to 44 dB against it); "
+                            "needs its recovery tables")
+        q.add_argument("--int4-tables", metavar="DIR",
+                       help="DLSSNR-AMD's linux/data/int4/rdna4 (default: $DLSSNR_INT4_TABLES, else the sibling DLSSNR-AMD checkout)")
         _add_controls(q)
 
     r = sub.add_parser("run", help="enhance an image")

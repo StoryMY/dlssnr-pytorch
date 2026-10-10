@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from . import int8, quant
+from . import int4, int8, quant
 from .plan import LayerSpec, build_plan, padding
 from .runtime import clear_caches
 from .weights import Weights
@@ -123,6 +123,7 @@ class NRNet(nn.Module):
     def run(self, image: torch.Tensor, controls=None, capture: bool = False) -> dict[int, object]:
         """Run every layer on the padded ``image`` tensor and return the kept outputs."""
         outputs: dict[int, object] = {}
+        int4.reset()
         for spec, layer in zip(self.plan, self.layers):
             if hasattr(layer, "controls") and controls is not None:
                 layer.controls = controls

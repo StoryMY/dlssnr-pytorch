@@ -75,6 +75,36 @@ attention from 35 to 8 ms, and the frame from 372 to about 190 ms. The multi-hea
 channels, about 100 ms at 1080p) still run as unfused PyTorch operations plus the Triton matrix products and
 attention; a one-kernel-per-window version of them was tried and was not faster.
 
+## int4 mixed network (optional)
+
+`--int4` runs the "int4 mixed" network of [DLSSNR-AMD](https://github.com/mauri870/DLSSNR-RDNA3): the heavy
+matrices of the vision-transformer blocks, of the C=512 attention and of the C=128 and C=256 Swin blocks
+(the MLP expansion and the QKV) run on an int4 grid, and most Swin blocks take a hard-swish for the cubic SiLU
+(its scale folded into the weights that follow). It is a different network, not NVIDIA's picture:
+
+```
+dlssnr run frame.png --int4 --int4-tables ../DLSSNR-AMD/linux/data/int4/rdna4
+python scripts/int4_check.py        # the three verification frames, against NVIDIA and against DLSSNR-AMD's int4 pictures
+```
+
+| Frame | vs NVIDIA | DLSSNR-AMD's int4 vs NVIDIA | vs DLSSNR-AMD's int4 picture | exact network vs NVIDIA |
+| --- | --- | --- | --- | --- |
+| 1920x1080 | 42.01 dB | 41.92 dB | 46.85 dB | 45.70 dB |
+| 2560x1440 | 43.49 dB | 43.36 dB | 47.29 dB | 48.26 dB |
+| 3840x2160 | 43.39 dB | 43.62 dB | 48.26 dB | 49.10 dB |
+
+- **The tables are DLSSNR-AMD's** (`linux/data/int4/rdna4`, 28 MB, calibrated on its own set of game frames) and are not
+  part of this repository. Point `--int4-tables` or `DLSSNR_INT4_TABLES` at them; the default is a `DLSSNR-AMD`
+  checkout beside this one. They hold no weights: the int4 weights are rebuilt from your extracted weights when the
+  network is built (a few seconds), by the decoder in `dlssnr/int4.py`, which reproduces all 83 matrices of
+  DLSSNR-AMD's installer bit for bit (`tests/test_int4.py`).
+- **It matches DLSSNR-AMD's network** to 46.9 to 48.3 dB (the exact network here matches its exact pictures to 48.0 and
+  49.8 dB at 1080p and 4K). The remaining difference is float rounding, which an int4 decision amplifies.
+- **There is no speed-up.** This emulates the int4 products exactly in float32, and it uses the reference arithmetic, not
+  the Triton kernels: 0.51 s a frame at 1080p and 2.3 s at 4K on a 7900 XTX (3.5 and 10.0 GiB), against 0.19 and 0.77 s
+  for the exact network. The result is the same on the CPU, bit for bit. The speed of the int4 network is in DLSSNR-AMD.
+- The method and the tables are DLSSNR-AMD's (MIT license, copyright mochizuki0323); this is a port of its arithmetic.
+
 ## Getting the weights
 
 `nvngx_dlssnr.dll` is NVIDIA's Neural Rendering library, shipped inside NVIDIA's DLSS 5 / NGX packages. The
@@ -90,6 +120,7 @@ dlssnr extract nvngx_dlssnr.dll -o weights.safetensors        # about a second, 
 ```bash
 dlssnr run frame.png -o enhanced.png                 # enhance an image
 dlssnr run frame.png --side-by-side                  # the input and the result in one picture
+dlssnr run frame.png --int4                           # the int4 mixed network of DLSSNR-AMD (see below)
 dlssnr run frame.png --intensity 1.5 --style 0 --local-tone 1 --local-structure 1 --skin-structure -1
 dlssnr verify --input frame.png --reference nvidia.png -o ours.png --min-psnr 44
 dlssnr plan 1920x1080                                # the layers of the network for a frame size

@@ -37,6 +37,9 @@ def triton_kernels(tensor: torch.Tensor) -> Kernels | None:
     """
     if not _TRITON or not tensor.is_cuda or torch.version.hip is None:
         return None
+    from . import int4
+    if int4.active():                      # the int4 network is defined by the reference arithmetic
+        return None
     try:
         from . import attention, gemm, swin_fused
     except ImportError:

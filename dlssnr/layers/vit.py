@@ -23,7 +23,7 @@ from typing import Callable
 import torch
 from torch import nn
 
-from .. import int8
+from .. import int4, int8
 from ..plan import LayerSpec
 from ..quant import q8
 from ..runtime import drain, triton_kernels
@@ -76,6 +76,8 @@ class VitFfnExpand(nn.Module):
     def __init__(self, spec: LayerSpec, weights: Weights):
         super().__init__()
         self.matmul = _Matmul(weights.e4m3(spec.block, spec.layer, "weight", spec.c_out, spec.c_in))
+        self.block = spec.block
+        self.ffn = int4.vit_ffn(weights, spec.block)
 
     @staticmethod
     def activation(x: torch.Tensor) -> torch.Tensor:
@@ -85,6 +87,11 @@ class VitFfnExpand(nn.Module):
     @torch.no_grad()
     def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
         height, width = x.shape[-2:]
+        if self.ffn is not None:
+            # int4: the activation stays unrounded for the contraction's int4 channels, which quantise it themselves
+            hidden = self.activation(self.ffn.expand_preactivation(to_tokens(x), self.block, self.matmul))
+            int4.side[("hidden", self.block)] = hidden
+            return to_map(q8(f16(hidden)), height, width)
         hidden = self.activation(self.matmul(to_tokens(x)))
         return to_map(q8(f16(hidden)), height, width)
 
@@ -96,12 +103,28 @@ class VitFfnContract(nn.Module):
         super().__init__()
         self.matmul = _Matmul(weights.e4m3(spec.block, spec.layer, "weight", spec.c_out, spec.c_in))
         self.register_buffer("gain", _skip_gain(weights, spec.block, spec.layer, spec.c_out))
+        self.block = spec.block
+        self.ffn = int4.vit_ffn(weights, spec.block) if spec.layer == 1 else None
+        # the f16 value this layer leaves for the next int4 consumer: the QKV of this block (contraction), or the
+        # expansion of the next block (projection)
+        self.stash = None
+        if int4.active():
+            if spec.layer == 1:
+                self.stash = ("c", spec.block)
+            elif int4.tables.has("vit", f"b{spec.block + 1}.ex.aq.bin"):
+                self.stash = ("stream", spec.block + 1)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         height, width = x.shape[-2:]
-        total = self.matmul(to_tokens(x)) + self.gain * to_tokens(skip)
-        return to_map(q8(f16(total)), height, width)
+        if self.ffn is not None:
+            product = self.ffn.contraction(to_tokens(x), int4.side[("hidden", self.block)])
+        else:
+            product = self.matmul(to_tokens(x))
+        value = f16(product + self.gain * to_tokens(skip))
+        if self.stash is not None:
+            int4.side[self.stash] = value
+        return to_map(q8(value), height, width)
 
 
 class VitProjection(VitFfnContract):
@@ -125,6 +148,8 @@ class VitQKV(nn.Module):
         self.matmul = _Matmul(torch.cat(matrices))
         self.channels = channels
         self.register_buffer("temperature", weights.f32(block, layer, "header", channels // HEAD_DIM))
+        self.block = block
+        self.i4 = int4.vit_matrix(weights, block, "qkv")
 
     @staticmethod
     def _inverse_norm(values: torch.Tensor) -> torch.Tensor:
@@ -141,7 +166,7 @@ class VitQKV(nn.Module):
         height, width = x.shape[-2:]
         channels = self.channels
         heads = channels // HEAD_DIM
-        projected = self.matmul(to_tokens(x)).to(torch.float16)
+        projected = (self.i4(int4.side[("c", self.block)]) if self.i4 is not None else self.matmul(to_tokens(x))).to(torch.float16)
         tokens = projected.shape[0]
         query, key, value = (projected[:, i * channels:(i + 1) * channels].reshape(tokens, heads, HEAD_DIM)
                              for i in range(3))

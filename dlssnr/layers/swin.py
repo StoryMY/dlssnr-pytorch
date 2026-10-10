@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .. import int8
+from .. import int4, int8
 from ..plan import LayerSpec
 from ..quant import q8
 from ..runtime import drain, fuse, triton_kernels
@@ -133,7 +133,7 @@ class SwinParams(nn.Module):
         contract_width = channels if heads > 1 else hidden
         bias = weights.f16(block, layer, "attn_pos_bias", heads * TOKENS * TOKENS).reshape(heads, -1)
         table, start = _residual_table(weights, block, layer)
-        return cls(
+        params = cls(
             channels, heads,
             expand=weights.e4m3(block, layer, "mlp_expand", hidden, channels), mid=mid,
             contract=weights.e4m3(block, layer, "mlp_contract", channels, contract_width),
@@ -144,6 +144,12 @@ class SwinParams(nn.Module):
             mlp_scale=table[start:start + channels].contiguous(),
             attn_scale=weights.f16(block, layer, "attn_residual_scale", -1)[:channels].contiguous(),
         )
+        params.i4 = int4.swin_site(weights, block, layer, channels, heads)
+        if params.i4 is not None and params.i4.fold:
+            # the hard-swish's output scale, folded into the weights that read the hidden and rounded to e4m3 again
+            folded = params.mid if heads > 1 else params.contract
+            folded.copy_(q8(folded * torch.tensor(params.i4.fold, dtype=torch.float32)))
+        return params
 
 
 # ---- window partition -----------------------------------------------------------------------------------
@@ -204,13 +210,29 @@ def _linear(x: torch.Tensor, weight: torch.Tensor, activate: bool = False) -> to
     return _activate(product) if activate else product
 
 
+def _hidden(params: SwinParams, quantised: torch.Tensor) -> torch.Tensor:
+    """The e4m3 hidden of the MLP, ``[n, 64, 4C]``: expansion and activation.
+
+    The int4 mixed network changes both: the expansion of some blocks runs in int4, and most blocks take the
+    hard-swish ``x * clamp(A x + B, 0, 1)`` for the cubic SiLU (its scale is folded into the weights that follow).
+    """
+    site = params.i4
+    if site is None:
+        return _linear(quantised, params.expand, activate=True)
+    if site.ex is not None:
+        pre = site.ex(quantised.reshape(-1, quantised.shape[-1])).reshape(*quantised.shape[:-1], -1)
+    else:
+        pre = int8.mm(quantised, params.expand.T, "swin")
+    return round8(int4.hard_swish(pre, *site.hs)) if site.hs else _activate(pre)
+
+
 def _mlp(params: SwinParams, quantised: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
     """``rs * x + Wc . hidden`` for ``[n, 64, C]`` tokens, still in float32 (rounded by the caller).
 
     The activation goes straight from the float32 accumulator to e4m3; the grouped middle projection is
     narrowed to f16 first.
     """
-    hidden = _linear(quantised, params.expand, activate=True)
+    hidden = _hidden(params, quantised)
     if params.mid is not None:
         groups = hidden.float().reshape(*hidden.shape[:-1], params.heads, -1)
         mid = params.mid.reshape(params.heads, HEAD_DIM, -1)
@@ -273,7 +295,7 @@ def _softmax(logits: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     return q8(_f16(numerators.float() * reciprocal.unsqueeze(-1)))
 
 
-def _attention(params: SwinParams, skip: torch.Tensor, quantised: torch.Tensor) -> torch.Tensor:
+def _attention(params: SwinParams, skip: torch.Tensor, quantised: torch.Tensor, inside: torch.Tensor | None = None) -> torch.Tensor:
     """``ars * skip + Wo . context`` for the quantised MLP output ``quantised`` (``[n, 64, C]``).
 
     Q and K are scaled straight from the float32 accumulator (Q also by the head's scale); V, the
@@ -285,7 +307,12 @@ def _attention(params: SwinParams, skip: torch.Tensor, quantised: torch.Tensor) 
         qkv = _linear(quantised, params.qkv).reshape(count * TOKENS, -1)
         context = kernels.attention.window_attention(qkv, params.head_scale, params.exp_bias)
         return skip * params.attn_scale + _linear(context, params.out_proj).reshape(count, TOKENS, -1)
-    qkv = _linear(quantised, params.qkv).reshape(count, TOKENS, heads, 3, HEAD_DIM)
+    if params.i4 is not None and params.i4.qkv is not None:
+        # int4: the QKV of the e4m3 MLP output; tokens outside the map have zero Q, K and V
+        qkv = params.i4.qkv(quantised.reshape(-1, quantised.shape[-1])).reshape(count, TOKENS, heads, 3, HEAD_DIM)
+        qkv = qkv * inside.reshape(count, TOKENS, 1, 1, 1)
+    else:
+        qkv = _linear(quantised, params.qkv).reshape(count, TOKENS, heads, 3, HEAD_DIM)
     query, key, value = qkv[..., 0, :], qkv[..., 1, :], qkv[..., 2, :]
     query, key, value = _normalise_qkv(query, key, value, params.head_scale)
     logits = torch.einsum("ntgd,nsgd->ngts", query, key)                     # [n, head, query, key]
@@ -316,13 +343,16 @@ def swin_block(params: SwinParams, x: torch.Tensor, shift_x: int, shift_y: int,
     residual = quantised if x_wide is None else _to_windows(x_wide, shift_y, shift_x)[0]
     per_window = max(1, _CHUNK_ELEMENTS // (params.heads * TOKENS * TOKENS))
     out = torch.empty_like(quantised)
+    inside = None
+    if params.i4 is not None and params.i4.qkv is not None:
+        inside = _to_windows(torch.ones(1, 1, height, width, device=x.device), shift_y, shift_x)[0]
     for start in range(0, quantised.shape[0], per_window):
         chunk = slice(start, start + per_window)
         y = _mlp(params, quantised[chunk], residual[chunk])
         y_quantised = store(y)
         # one head keeps the unrounded MLP output as the attention skip; several heads use its e4m3 form
         skip = y if params.heads == 1 else y_quantised
-        out[chunk] = _attention(params, skip, y_quantised)
+        out[chunk] = _attention(params, skip, y_quantised, None if inside is None else inside[chunk])
         drain(out.device)
     acc = _from_windows(out, grid, height, width)
     wide = _f16(acc)

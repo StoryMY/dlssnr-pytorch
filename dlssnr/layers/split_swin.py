@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .. import int8
+from .. import int4, int8
 from ..plan import LayerSpec
 from ..quant import q8
 from ..weights import Weights
@@ -205,11 +205,20 @@ class SplitFfwdProj(_Projection):
     with the block input as ``skip``.
     """
 
+    def __init__(self, spec: LayerSpec, weights: Weights):
+        super().__init__(spec, weights)
+        self.block = spec.block
+        # int4: the attention's QKV quantises this projection's f16 value, so leave it for that layer
+        self.stash = int4.active() and int4.tables.has("vit", f"b{spec.block}.attn.aq.bin")
+
     @torch.no_grad()
     def forward(self, x, skip: torch.Tensor | None = None) -> torch.Tensor:
         if isinstance(x, tuple):
             x, skip = x
-        return q8(self.project(x, skip))
+        value = self.project(x, skip)
+        if self.stash:
+            int4.side[("attn", self.block)] = value
+        return q8(value)
 
 
 class SplitProj(_Projection):
@@ -280,6 +289,8 @@ class SplitQKVAttn(nn.Module):
         self.register_buffer("qkv", qkv.t().contiguous())                               # [512, 16 * 96]
         self.register_buffer("bias", self.unpack_bias(weights.f16(block, layer, "attn_pos_bias", HEADS, 4096)))
         self.register_buffer("scale", weights.f32(block, layer, "tail", HEADS))
+        self.block = block
+        self.i4 = int4.attention_matrix(weights, block, layer)
 
     @staticmethod
     def unpack_bias(raw: torch.Tensor) -> torch.Tensor:
@@ -339,7 +350,13 @@ class SplitQKVAttn(nn.Module):
         _, channels, height, width = x.shape
         tokens, (rows, cols, top, left) = self.windows(x)
         count = tokens.shape[0]
-        qkv = int8.mm(tokens, self.qkv, "split").reshape(count, 64, HEADS, 3, HEAD_DIM)
+        if self.i4 is not None:
+            # int4: the QKV of the projection's f16 value; tiles outside the map have zero Q, K and V
+            inside = self.windows(torch.ones_like(x[:, :1]))[0]
+            value = self.windows(int4.side[("attn", self.block)])[0]
+            qkv = (self.i4(value.reshape(-1, channels)) * inside.reshape(-1, 1)).reshape(count, 64, HEADS, 3, HEAD_DIM)
+        else:
+            qkv = int8.mm(tokens, self.qkv, "split").reshape(count, 64, HEADS, 3, HEAD_DIM)
         query = self.normalise(qkv[..., 0, :].to(torch.float16))
         key = self.normalise(qkv[..., 1, :].to(torch.float16))
         query = q8((query * self.scale.to(torch.float16)[:, None]).to(torch.float32))
