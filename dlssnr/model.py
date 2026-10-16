@@ -21,7 +21,7 @@ import torch
 from torch import nn
 
 from . import int4, int8, quant
-from .plan import LayerSpec, build_plan, padding
+from .plan import NETWORKS, LayerSpec, build_plan, padding
 from .runtime import clear_caches
 from .weights import Weights
 
@@ -50,13 +50,21 @@ class NRNet(nn.Module):
     """The enhancement network for frames of one size."""
 
     def __init__(self, weights: Weights, width: int, height: int,
-                 builders: dict[str, Callable[[LayerSpec, Weights], nn.Module]] | None = None):
+                 builders: dict[str, Callable[[LayerSpec, Weights], nn.Module]] | None = None,
+                 network: str | None = None):
         super().__init__()
+        # which network the weights are of: extraction records it; a file made before the library had two is the original
+        self.network = network or (weights.metadata if weights is not None else {}).get("network", "ht")
+        if self.network not in NETWORKS:
+            raise ValueError(f"unknown network {self.network!r}; choose from {', '.join(NETWORKS)}")
+        if self.network != "ht" and int4.active():
+            raise NotImplementedError("the int4 mixed network is calibrated on the original network ('ht'), not "
+                                      f"{self.network!r}")
         # Cached per-weight copies are keyed by address; a network built after another was freed may reuse it.
         clear_caches()
         self.width, self.height = width, height
-        self.plan = build_plan(width, height)
-        self.padding = padding(width, height)
+        self.plan = build_plan(width, height, self.network)
+        self.padding = padding(width, height, self.network)
         builders = builders if builders is not None else _registry()
         missing = sorted({s.kind for s in self.plan} - builders.keys())
         if missing:
@@ -87,7 +95,8 @@ class NRNet(nn.Module):
             elif s.kind == "VitProjection":
                 source = index[s.block, 1]
             elif s.skip_block >= 0:
-                source = index[s.skip_block, 3 if s.skip_block == 30 else 0]
+                # the bottleneck's skip is the pooled split block's pool layer; an encoder skip is a level's downsample
+                source = index[s.skip_block, 3 if s.kind == "DecInputUpsample" else 0]
             sources.append(source)
         return sources
 

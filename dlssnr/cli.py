@@ -72,7 +72,7 @@ def _enhance(args, frame):
 def cmd_extract(args) -> int:
     from .extract import extract
 
-    weights = extract(args.library, args.output)
+    weights = extract(args.library, args.output, args.variant)
     print(f"{len(weights.tensors)} tensors -> {args.output}")
     return 0
 
@@ -154,8 +154,8 @@ def cmd_plan(args) -> int:
     from .plan import build_plan
 
     width, height = (int(v) for v in args.size.lower().split("x"))
-    specs = build_plan(width, height)
-    print(f"{len(specs)} layers for a {width}x{height} frame")
+    specs = build_plan(width, height, args.network)
+    print(f"{len(specs)} layers of the {args.network} network for a {width}x{height} frame")
     last = None
     for s in specs:
         key = (s.block, s.kind, s.channels, s.w, s.h)
@@ -172,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
     e = sub.add_parser("extract", help="read NVIDIA's nvngx_dlssnr.dll (or a zip holding it) and write the weights")
     e.add_argument("library")
     e.add_argument("-o", "--output", default=DEFAULT_WEIGHTS)
+    e.add_argument("--variant", choices=("ht", "small"), default="ht",
+                   help="which network of the library: 'ht' (the original) or 'small' (310.9 and later)")
     e.set_defaults(func=cmd_extract)
 
     def common(q: argparse.ArgumentParser) -> None:
@@ -213,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
 
     pl = sub.add_parser("plan", help="print the layers of the network for a frame size, e.g. 1920x1080")
     pl.add_argument("size")
+    pl.add_argument("--network", choices=("ht", "small"), default="ht", help="the original network or the lighter one")
     pl.set_defaults(func=cmd_plan)
 
     args = p.parse_args(argv)

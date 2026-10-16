@@ -115,6 +115,45 @@ contains it:
 dlssnr extract nvngx_dlssnr.dll -o weights.safetensors        # about a second, 141 MB
 ```
 
+### The lighter network (310.9.16.0 and later)
+
+From version 310.9.16.0 the library holds a second network next to the original: a resource `WEIGHTS_CC_SMALL_FP8`
+beside `WEIGHTS_HT` (the original's weights are byte for byte the ones this project was built on). NVIDIA's DLSS 5 update describes a
+lighter model: about 24 % fewer parameters and half the GPU overhead. It uses the same layer families and packings
+with fewer layers, and the library picks one of the two by a preset. Extract it into its own file; the file records
+which network it holds, so nothing else changes:
+
+```
+dlssnr extract nvngx_dlssnr.dll --variant small -o weights-small.safetensors     # 109 MB
+dlssnr run frame.png --weights weights-small.safetensors
+dlssnr plan 1920x1080 --network small
+```
+
+| | original ("ht") | lighter ("small") |
+| --- | --- | --- |
+| blocks / layers | 71 / 152 | 31 / 76 |
+| parameters (e4m3 weights and scales) | 145.8 M | 113.3 M |
+| per level (C = 32, 64, 128, 256) | 4, 4, 6, 8 Swin layers | 2, 2, 2, 2 |
+| split blocks, each side of the transformer | 8 | 2 |
+| transformer blocks | 8 | 8 |
+| 1080p / 4K, 7900 XTX (Triton path) | 181 ms / 717 ms | 94 ms / 364 ms |
+| against NVIDIA's original-network output | 45.7 / 48.3 / 49.1 dB | 33.9 / 34.7 / 36.1 dB |
+
+The last row compares a different network with the original's output, so it says how close the two are, not how right
+the lighter implementation is. **The lighter network is not verified against NVIDIA's own output of it**, which needs
+the library run on an NVIDIA GPU with that preset; what is established is below.
+
+- The weights, the layer families, every record's size and the packing are read from the library.
+- The wiring is not stored as data: the library builds the network in code. It is the original's rules at the smaller
+  depth: the U-Net skips pair each upsample with its level's downsample, the bottleneck skip is the pooled split block,
+  and the window shifts cycle through (0,0), (-1,-1), (-1,0), (0,-1) with each encoder level starting over and each
+  decoder level continuing where its encoder level stopped. `scripts/small_shift_probe.py` scores the alternatives:
+  the shifts matter (no shifts at all costs 5.8 and 4.7 dB against NVIDIA's output, unshifted split blocks 1.3 and
+  3.4 dB), and the rule above is the best of the variants tried, but the differences between decoder offsets are
+  0.1 to 0.2 dB, so that part is the inference least supported by the measurements.
+- Its edit correlates 0.93, 0.90 and 0.91 with the original's at 1080p, 1440p and 4K, and it runs 1.9 times faster;
+  the int4 mixed network is calibrated on the original and refuses the lighter one.
+
 ## Running it
 
 ```bash
@@ -189,8 +228,9 @@ baked into the exponent.
   operations.
 - The Triton kernels have only been run on the 7900 XTX (ROCm). They use an AMD instruction, so the CUDA build
   stays on the reference arithmetic.
-- The layouts of the weight file were worked out from the library by inspection; a different version of
-  `nvngx_dlssnr.dll` than the one this was built against may not extract.
+- The layouts of the weight file were worked out from the library by inspection; a version of
+  `nvngx_dlssnr.dll` whose records have other sizes stops the extractor with an error. 310.9.16.0 extracts, both
+  networks. The lighter network's wiring is inferred, not read (see above).
 
 The code is under the MIT license (see `LICENSE`); the network's weights are NVIDIA's and are not covered by it.
 

@@ -61,6 +61,25 @@ _SHIFT_CYCLE = ((0, 0), (-1, -1), (-1, 0), (0, -1))
 PLAIN, PRE, POST, DOWN, SWIN_UP, DECODER_UP, FINAL_HEAD = range(7)
 
 
+class _Shape_(NamedTuple):
+    """How deep one network is: layers per encoder level (C = 32, 64, 128, 256), blocks in each of the two split
+    sections, and the shift-cycle position each decoder level starts at (C = 256, 128, 64, 32), which is the
+    encoder's layer count at that level, taken modulo the cycle length."""
+    encoder: tuple[int, int, int, int]
+    split: int
+    decoder_start: tuple[int, int, int, int]
+
+
+# "ht" is the network of 310.8.0 and later (71 blocks, 152 layers). "small" is the lighter one 310.9.16.0 adds
+# (31 blocks, 77 records): one plain and one downsample layer per level, two split blocks on each side of the
+# eight transformer blocks. Its layers are the same families; the rest is read off the weight records and, where
+# the library builds it in code, taken from the original's rules (see ``_rows``).
+NETWORKS = {
+    "ht": _Shape_((4, 4, 6, 8), 8, (0, 2, 0, 0)),
+    "small": _Shape_((2, 2, 2, 2), 2, (2, 2, 2, 2)),
+}
+
+
 class _Row(NamedTuple):
     block: int
     layer: int
@@ -75,7 +94,8 @@ class _Row(NamedTuple):
     skip: tuple[int, int] | None    # (block, layer) of the layer whose extent the output takes over
 
 
-def _rows() -> list[_Row]:
+def _rows(network: str = "ht") -> list[_Row]:
+    shape = NETWORKS[network]
     rows: list[_Row] = []
 
     def swin(block, heads, channels, tag, shift, c_in=None, c_out=None, role=PLAIN, skip=None):
@@ -88,12 +108,15 @@ def _rows() -> list[_Row]:
 
     # Encoder: four levels of Swin blocks, each ending in a downsample that doubles the channels.
     block = 1
-    for heads, channels, count in ((1, 32, 4), (2, 64, 4), (4, 128, 6), (8, 256, 8)):
+    downsample_blocks = []
+    for (heads, channels), count in zip(((1, 32), (2, 64), (4, 128), (8, 256)), shape.encoder):
         for i in range(count):
             first, last = i == 0, i == count - 1
             tag = "inpview_" if first else "ds_" if last else ""
             swin(block, heads, channels, tag, _SHIFT_CYCLE[i % 4], c_out=2 * channels if last else None,
                  role=DOWN if last else PLAIN)
+            if last:
+                downsample_blocks.append(block)
             block += 1
 
     def split_block(block, shift, first=False, last=False, pool=False):
@@ -117,28 +140,33 @@ def _rows() -> list[_Row]:
             rows.append(_Row(block, 3, "CCSplitSwin16HProj", f"{pre}proj_512_fp8", 512, 8, 512, 512,
                              (0, 0), PLAIN, None))
 
-    for i in range(8):
-        split_block(23 + i, _SHIFT_CYCLE[i % 4], first=i == 0, pool=i == 7)
+    for i in range(shape.split):
+        split_block(block, _SHIFT_CYCLE[i % 4], first=i == 0, pool=i == shape.split - 1)
+        block += 1
+    pool_block = block - 1
 
     # Bottleneck: eight transformer blocks over the flattened tokens.
     vit = (("ffn_expand", "FfnExpand", 1024, 4096), ("ffn_contract", "FfnContract", 4096, 1024),
            ("qkv", "QKV", 1024, 1024), ("attention", "Attention", 1024, 1024),
            ("projection", "Projection", 1024, 1024))
-    for block in range(31, 39):
+    for _ in range(8):
         for layer, (stem, cls, c_in, c_out) in enumerate(vit):
             rows.append(_Row(block, layer, f"CCVit1D{cls}", f"cc_vit_1d_{stem}_fp8", 1024, 4, c_in, c_out,
                              (0, 0), PLAIN, None))
+        block += 1
 
     # Decoder: the bottleneck output is upsampled onto the final-head extent, then split blocks, then one
     # Swin level per encoder level, each opened by an upsample that takes the matching encoder skip.
-    rows.append(_Row(39, 0, "CCDecInputUpsample", "cc_dec_input_upsample_1024_512_fp8", 512, 1, 1024, 512,
-                     (0, 0), DECODER_UP, (30, 3)))
-    for i in range(8):
-        split_block(40 + i, _SHIFT_CYCLE[i % 4], last=i == 7)
+    rows.append(_Row(block, 0, "CCDecInputUpsample", "cc_dec_input_upsample_1024_512_fp8", 512, 1, 1024, 512,
+                     (0, 0), DECODER_UP, (pool_block, 3)))
+    block += 1
+    for i in range(shape.split):          # the decoder continues the encoder's shift cycle, as its Swin levels do
+        split_block(block, _SHIFT_CYCLE[(shape.split + i) % 4], last=i == shape.split - 1)
+        block += 1
 
-    block = 48
-    for heads, channels, count, start, skip_block in ((8, 256, 8, 0, 22), (4, 128, 6, 2, 14),
-                                                      (2, 64, 4, 0, 8), (1, 32, 4, 0, 4)):
+    levels = zip(((8, 256), (4, 128), (2, 64), (1, 32)), reversed(shape.encoder), shape.decoder_start,
+                 reversed(downsample_blocks))
+    for (heads, channels), count, start, skip_block in levels:
         for i in range(count):
             first, last = i == 0, i == count - 1
             tag = "upsample_" if first else "outview_" if last else ""
@@ -146,7 +174,7 @@ def _rows() -> list[_Row]:
                  c_in=2 * channels if first else None, role=SWIN_UP if first else PLAIN,
                  skip=(skip_block, 0) if first else None)
             block += 1
-    rows.append(_Row(70, 0, "CCTinlayoutFusedPostBlockSwin1H", "cc_tinlayout_fused_post_block_swin_1h_32_fp8",
+    rows.append(_Row(block, 0, "CCTinlayoutFusedPostBlockSwin1H", "cc_tinlayout_fused_post_block_swin_1h_32_fp8",
                      3, 0, 32, 3, (-1, -1), POST, None))
     return rows
 
@@ -208,7 +236,7 @@ class Padding(NamedTuple):
     pad_y: int
 
 
-def padding(width: int, height: int) -> Padding:
+def padding(width: int, height: int, network: str = "ht") -> Padding:
     """The extent the frame is padded to before entering the network, and the padding added.
 
     Every halving of an axis needs its extent divisible by two, so each axis is rounded up to a multiple
@@ -217,7 +245,7 @@ def padding(width: int, height: int) -> Padding:
     """
     if not (0 < width <= 16384 and 0 < height <= 16384):
         raise ValueError(f"unsupported frame size {width}x{height}")
-    _, halvings_x, halvings_y = _walk(width, height, _ROWS)
+    _, halvings_x, halvings_y = _walk(width, height, ROWS[network])
     align_x, align_y = 1 << halvings_x, 1 << halvings_y
     padded_w = max(320, _up(width, align_x))
     padded_h = max(320, _up(height, align_y))
@@ -226,18 +254,19 @@ def padding(width: int, height: int) -> Padding:
     return Padding(padded_w, padded_h, padded_w - width, padded_h - height)
 
 
-def working_extent(width: int, height: int) -> tuple[int, int]:
+def working_extent(width: int, height: int, network: str = "ht") -> tuple[int, int]:
     """(width, height) in frame pixels of the padded frame the network processes."""
-    padded = padding(width, height)
+    padded = padding(width, height, network)
     return padded.width, padded.height
 
 
-def build_plan(width: int, height: int) -> list[LayerSpec]:
-    """The 152 layer specs for a ``width`` x ``height`` frame."""
-    padded = padding(width, height)
-    shapes, _, _ = _walk(padded.width, padded.height, _ROWS)
+def build_plan(width: int, height: int, network: str = "ht") -> list[LayerSpec]:
+    """The layer specs of ``network`` (152 for "ht", 77 for "small") for a ``width`` x ``height`` frame."""
+    padded = padding(width, height, network)
+    rows = ROWS[network]
+    shapes, _, _ = _walk(padded.width, padded.height, rows)
     specs: list[LayerSpec] = []
-    for index, (row, (current, out)) in enumerate(zip(_ROWS, shapes)):
+    for index, (row, (current, out)) in enumerate(zip(rows, shapes)):
         plan = current
         if row.role == FINAL_HEAD:
             plan = out
@@ -245,7 +274,7 @@ def build_plan(width: int, height: int) -> list[LayerSpec]:
             plan = _Shape(_up(out.w, 4), _up(out.h, 4))
         elif row.role == POST:
             plan = _Shape(padded.height // 2, padded.width // 2)
-        tokens = plan.w * plan.h if 31 <= row.block <= 38 else _up(plan.w, 8) * _up(plan.h, 8)
+        tokens = plan.w * plan.h if row.cls.startswith("CCVit1D") else _up(plan.w, 8) * _up(plan.h, 8)
         grid = out if row.role in (POST, SWIN_UP) else plan
         sx, sy = row.shift
         skip_block = row.skip[0] if row.skip else 0 if row.role == POST else -1
@@ -259,4 +288,4 @@ def build_plan(width: int, height: int) -> list[LayerSpec]:
     return specs
 
 
-_ROWS = _rows()
+ROWS = {network: _rows(network) for network in NETWORKS}

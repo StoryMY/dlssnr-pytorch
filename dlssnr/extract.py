@@ -1,7 +1,7 @@
 """Extract the network's weights from NVIDIA's ``nvngx_dlssnr.dll``.
 
-The library is only ever read as bytes, never loaded or executed. The weights live in a PE resource
-named ``WEIGHTS_HT``: a flat list of records, one per layer (``block{B}.layer{L}.layer``) plus a couple
+The library is only ever read as bytes, never loaded or executed. The weights live in PE resources
+(``WEIGHTS_HT``, and from 310.9 also ``WEIGHTS_CC_SMALL_FP8``): each a flat list of records, one per layer (``block{B}.layer{L}.layer``) plus a couple
 of scalar records. Each record is an opaque payload whose internal layout depends on the layer family.
 This module slices every payload into its named tensors and writes them, as exact bytes, to a
 ``dlssnr.weights.Weights`` file (safetensors) keyed ``block{B}.layer{L}.{name}``, flat uint8.
@@ -116,7 +116,10 @@ from .weights import Weights
 
 FORMAT = "dlssnr-weights-1"
 LIBRARY_NAME = "nvngx_dlssnr.dll"
-RESOURCE_NAME = "WEIGHTS_HT"
+# The library holds one weight resource per network. 310.8.0 has only "ht"; 310.9.16.0 adds "small", a shallower
+# network (31 blocks, 77 records) built from the same layer families and the same packings.
+RESOURCES = {"ht": "WEIGHTS_HT", "small": "WEIGHTS_CC_SMALL_FP8"}
+RESOURCE_NAME = RESOURCES["ht"]
 
 SLICE_BYTES = 512  # 16 outputs x 32 inputs of e4m3
 
@@ -385,8 +388,8 @@ def _sections(image: mmap.mmap) -> tuple[list[tuple[int, int, int]], tuple[int, 
     return sections, resource
 
 
-def _find_weights_resource(image: mmap.mmap) -> tuple[int, int]:
-    """File offset and size of the ``WEIGHTS_HT`` resource."""
+def _find_weights_resource(image: mmap.mmap, resource_name: str = RESOURCE_NAME) -> tuple[int, int]:
+    """File offset and size of the named weight resource (``WEIGHTS_HT`` by default)."""
     sections, (resource_rva, resource_size) = _sections(image)
 
     def file_offset(rva: int, size: int) -> int:
@@ -396,7 +399,7 @@ def _find_weights_resource(image: mmap.mmap) -> tuple[int, int]:
         raise ExtractError(f"resource data at RVA {rva:#x} is not backed by the file")
 
     if not resource_rva:
-        raise ExtractError(f"no resource section: this is not an NVIDIA DLSS-NR library ({RESOURCE_NAME} missing)")
+        raise ExtractError(f"no resource section: this is not an NVIDIA DLSS-NR library ({resource_name} missing)")
     root = file_offset(resource_rva, resource_size)
 
     def walk(directory: int, path: tuple[str, ...], depth: int):
@@ -416,10 +419,14 @@ def _find_weights_resource(image: mmap.mmap) -> tuple[int, int]:
                 rva, size = struct.unpack_from("<II", image, root + target)
                 yield path + (label,), rva, size
 
+    found = []
     for path, rva, size in walk(0, (), 0):
-        if RESOURCE_NAME in path:
+        if resource_name in path:
             return file_offset(rva, size), size
-    raise ExtractError(f"no {RESOURCE_NAME} resource: this is not an NVIDIA DLSS-NR library")
+        found.append(path[1] if len(path) > 1 else path[0])
+    present = sorted(name for name in found if name.startswith("WEIGHTS"))
+    raise ExtractError(f"no {resource_name} resource in this library"
+                       + (f" (it has {', '.join(present)})" if present else ": this is not an NVIDIA DLSS-NR library"))
 
 
 _RECORD_NAME = re.compile(r"block(\d+)\.layer(\d+)\.(\w+)")
@@ -476,8 +483,10 @@ def _open_library(path: Path, scratch: Path) -> tuple[BinaryIO, str, int]:
     return handle, digest.hexdigest(), size
 
 
-def extract(path: str, out_path: str) -> Weights:
-    """Read the library (or a zip holding it) at ``path`` and save its weights to ``out_path``."""
+def extract(path: str, out_path: str, variant: str = "ht") -> Weights:
+    """Read the library (or a zip holding it) at ``path`` and save the weights of network ``variant`` to ``out_path``."""
+    if variant not in RESOURCES:
+        raise ExtractError(f"unknown network {variant!r}; choose from {', '.join(RESOURCES)}")
     source = Path(path)
     if not source.is_file():
         raise ExtractError(f"no such file: {path}")
@@ -489,7 +498,7 @@ def extract(path: str, out_path: str) -> Weights:
             raise ExtractError(f"{path} is empty")
         with handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as image:
             try:
-                offset, resource_size = _find_weights_resource(image)
+                offset, resource_size = _find_weights_resource(image, RESOURCES[variant])
                 records = list(iter_records(image, offset, resource_size))
                 if not records:
                     raise ExtractError("the weight resource is empty")
@@ -500,7 +509,7 @@ def extract(path: str, out_path: str) -> Weights:
         if failure:
             raise ExtractError(failure)
     metadata = {"format": FORMAT, "source": LIBRARY_NAME, "dll_sha256": sha256, "dll_size": str(size),
-                "records": str(len(records))}
+                "records": str(len(records)), "network": variant}
     weights = Weights(tensors, metadata)
     weights.save(out_path)
     return weights
@@ -538,9 +547,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dlssnr extract", description="Extract the network weights from nvngx_dlssnr.dll.")
     parser.add_argument("source", help="nvngx_dlssnr.dll, or a zip that contains it")
     parser.add_argument("-o", "--output", default="weights.safetensors", help="output file (default: %(default)s)")
+    parser.add_argument("--variant", choices=sorted(RESOURCES), default="ht",
+                        help="which network of the library: 'ht' (the original) or 'small' (310.9 and later) (default: %(default)s)")
     args = parser.parse_args(argv)
     try:
-        weights = extract(args.source, args.output)
+        weights = extract(args.source, args.output, args.variant)
     except ExtractError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

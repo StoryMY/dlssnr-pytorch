@@ -73,3 +73,33 @@ def test_1080p_working_extent_pads_height_to_1088():
 def test_rejects_degenerate_sizes():
     with pytest.raises(ValueError):
         build_plan(0, 100)
+
+
+SMALL_SIZES = [(1920, 1080), (3840, 2160), (1366, 768), (100, 50)]
+
+
+@pytest.mark.parametrize("size", SMALL_SIZES)
+def test_the_small_network_has_the_extracted_records(size):
+    """The small plan has a layer for each of the library's weight records (77, with the blend scale) and the same padding."""
+    plan = build_plan(*size, "small")
+    assert len(plan) == 76 and plan[0].block == 0 and plan[-1].block == 30
+    assert [s.block for s in plan] == sorted(s.block for s in plan)
+    assert {s.kind for s in plan} <= set(KINDS.values())
+    assert padding(*size, "small") == padding(*size)
+
+
+def test_the_small_network_is_shallower_in_the_same_levels():
+    plan = {(s.block, s.layer): s for s in build_plan(1920, 1080, "small")}
+    assert [plan[b, 0].channels for b in range(1, 9)] == [32, 32, 64, 64, 128, 128, 256, 256]
+    assert [plan[b, 0].variant for b in (1, 2, 3, 4)] == ["inpview", "ds", "inpview", "ds"]
+    assert [plan[b, 0].kind for b in range(11, 19)] == ["VitFfnExpand"] * 8
+    assert plan[10, 4].kind == "SplitFinalHead" and plan[19, 0].kind == "DecInputUpsample"
+    assert [plan[b, 0].variant for b in (22, 23, 28, 29)] == ["upsample", "outview", "upsample", "outview"]
+    assert plan[19, 0].skip_block == 10 and [plan[b, 0].skip_block for b in (22, 24, 26, 28)] == [8, 6, 4, 2]
+    shifts = {b: (plan[b, 2].shift_x, plan[b, 2].shift_y) for b in (9, 10, 20, 21)}
+    assert shifts == {9: (0, 0), 10: (-1, -1), 20: (-1, 0), 21: (0, -1)}      # the decoder continues the cycle
+
+
+def test_an_unknown_network_is_refused():
+    with pytest.raises(KeyError):
+        build_plan(1920, 1080, "huge")

@@ -17,10 +17,10 @@ class Recorder(nn.Module):
         return (self.spec.index, -self.spec.index)
 
 
-def _net():
+def _net(network="ht"):
     log: dict = {}
     builders = {kind: (lambda spec, weights: Recorder(spec, log)) for kind in KINDS.values()}
-    return NRNet(None, 1920, 1080, builders=builders), log
+    return NRNet(None, 1920, 1080, builders=builders, network=network), log
 
 
 def test_skip_sources_point_backwards_and_match_the_plan():
@@ -42,3 +42,16 @@ def test_every_layer_runs_in_order():
     assert log[index[66, 0]][0] == index[65, 0]
     assert log[index[66, 0]][1] == (index[4, 0], -index[4, 0])
     assert log[index[70, 0]][1] == -index[0, 0]
+
+
+def test_the_small_network_is_wired_like_the_original():
+    net, log = _net("small")
+    index = {(s.block, s.layer): s.index for s in net.plan}
+    assert len(net.plan) == 76 and net.plan[-1].block == 30
+    for up, down in ((22, 8), (24, 6), (26, 4), (28, 2), (30, 0)):
+        assert net.skip_source[index[up, 0]] == index[down, 0]
+    assert net.skip_source[index[19, 0]] == index[10, 3]              # the bottleneck's skip is the pool layer
+    assert net.skip_source[index[11, 1]] == index[10, 4]              # the first transformer block reads the final head
+    outputs = net.run(torch.zeros(1, 3, 1088, 1920), capture=True)
+    assert sorted(log) == list(range(76)) and len(outputs) == 76
+    assert log[index[28, 0]][1] == (index[2, 0], -index[2, 0])
