@@ -74,14 +74,14 @@ def _mirror(index: torch.Tensor, extent: int) -> torch.Tensor:
     return reflected.clamp(0, extent - 1)
 
 
-def frame_to_tensor(frame: np.ndarray, device: torch.device | str = "cpu") -> torch.Tensor:
+def frame_to_tensor(frame: np.ndarray, device: torch.device | str = "cpu", network: str = "ht") -> torch.Tensor:
     """``uint8 [height, width, 3]`` -> float32 ``[1, 3, rows, columns]``, values k/255, padded to the working extent.
 
     The padding rows and columns repeat the frame mirrored about its last row/column, as the network
     expects them. The frame is moved to ``device`` as bytes and converted there.
     """
     height, width, _ = frame.shape
-    work = padding(width, height)
+    work = padding(width, height, network)
     # a table rather than ``/ 255``: a GPU divides by a constant as a multiplication by its reciprocal
     levels = (torch.arange(256, dtype=torch.float32) / 255.0).to(device)
     pixels = levels[torch.from_numpy(frame).to(device).long()].permute(2, 0, 1)             # [3, height, width]

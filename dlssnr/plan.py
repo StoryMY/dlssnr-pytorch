@@ -68,6 +68,7 @@ class _Shape_(NamedTuple):
     encoder: tuple[int, int, int, int]
     split: int
     decoder_start: tuple[int, int, int, int]
+    wide_alignment: bool = False       # an axis aligns to twice as much where the pre block's output is 4 mod 8
 
 
 # "ht" is the network of 310.8.0 and later (71 blocks, 152 layers). "small" is the lighter one 310.9.16.0 adds
@@ -76,7 +77,7 @@ class _Shape_(NamedTuple):
 # the library builds it in code, taken from the original's rules (see ``_rows``).
 NETWORKS = {
     "ht": _Shape_((4, 4, 6, 8), 8, (0, 2, 0, 0)),
-    "small": _Shape_((2, 2, 2, 2), 2, (2, 2, 2, 2)),
+    "small": _Shape_((2, 2, 2, 2), 2, (2, 2, 2, 2), wide_alignment=True),
 }
 
 
@@ -247,6 +248,12 @@ def padding(width: int, height: int, network: str = "ht") -> Padding:
         raise ValueError(f"unsupported frame size {width}x{height}")
     _, halvings_x, halvings_y = _walk(width, height, ROWS[network])
     align_x, align_y = 1 << halvings_x, 1 << halvings_y
+    if NETWORKS[network].wide_alignment:
+        # The lighter network's library code aligns an axis to twice that when the pre block's output along it,
+        # up((n + 1) / 2, 4), is 4 mod 8: 1080 pads to 1152, not 1088. Measured against NVIDIA's 310.9.16 output
+        # (DLSSNR-AMD found the rule); the original network keeps its extents.
+        align_x *= 2 if _up((width + 1) // 2, 4) % 8 == 4 else 1
+        align_y *= 2 if _up((height + 1) // 2, 4) % 8 == 4 else 1
     padded_w = max(320, _up(width, align_x))
     padded_h = max(320, _up(height, align_y))
     if padded_h % (align_y * 4) == 0 and padded_w % (align_x * 4) == 0:

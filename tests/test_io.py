@@ -65,3 +65,9 @@ def test_png_round_trip(tmp_path):
     frame = _frame(33, 21)
     save_image(str(tmp_path / "a.png"), frame)
     assert np.array_equal(load_image(str(tmp_path / "a.png")), frame)
+
+
+def test_the_frame_is_padded_to_the_extent_of_its_network():
+    frame = np.arange(1080 * 8 * 3, dtype=np.uint8).reshape(1080, 8, 3)
+    assert frame_to_tensor(frame).shape[-2:] == (1088, 320)
+    assert frame_to_tensor(frame, network="small").shape[-2:] == (1152, 320)

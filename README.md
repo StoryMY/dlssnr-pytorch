@@ -118,10 +118,11 @@ dlssnr extract nvngx_dlssnr.dll -o weights.safetensors        # about a second, 
 ### The lighter network (310.9.16.0 and later)
 
 From version 310.9.16.0 the library holds a second network next to the original: a resource `WEIGHTS_CC_SMALL_FP8`
-beside `WEIGHTS_HT` (the original's weights are byte for byte the ones this project was built on). NVIDIA's DLSS 5 update describes a
-lighter model: about 24 % fewer parameters and half the GPU overhead. It uses the same layer families and packings
-with fewer layers, and the library picks one of the two by a preset. Extract it into its own file; the file records
-which network it holds, so nothing else changes:
+beside `WEIGHTS_HT` (the original's weights are byte for byte the ones this project was built on). It is the lighter
+model NVIDIA's DLSS 5 update describes, about 24 % fewer parameters and half the GPU overhead, and it is the library's
+default: a creation parameter, `DLSSNR.Hint.Render.Preset`, picks the network (1 the original, 2 the new one, which is
+also what you get with none; as DLSSNR-AMD found). It uses the same layer families and packings with fewer layers. Extract it into its own
+file; the file records which network it holds, so nothing else changes:
 
 ```
 dlssnr extract nvngx_dlssnr.dll --variant small -o weights-small.safetensors     # 109 MB
@@ -136,23 +137,30 @@ dlssnr plan 1920x1080 --network small
 | per level (C = 32, 64, 128, 256) | 4, 4, 6, 8 Swin layers | 2, 2, 2, 2 |
 | split blocks, each side of the transformer | 8 | 2 |
 | transformer blocks | 8 | 8 |
-| 1080p / 4K, 7900 XTX (Triton path) | 181 ms / 717 ms | 94 ms / 364 ms |
-| against NVIDIA's original-network output | 45.7 / 48.3 / 49.1 dB | 33.9 / 34.7 / 36.1 dB |
+| 1080p / 1440p / 4K, 7900 XTX (Triton path) | 179 / 307 / 719 ms | 93 / 153 / 361 ms |
+| against NVIDIA's output of the same network, 1080p / 1440p / 4K | 45.7 / 48.3 / 49.1 dB | 49.5 / 49.5 / 50.6 dB |
+| SSIM, edit correlation (1080p) | 0.9961, 0.9947 | 0.9971, 0.9957 |
 
-The last row compares a different network with the original's output, so it says how close the two are, not how right
-the lighter implementation is. **The lighter network is not verified against NVIDIA's own output of it**, which needs
-the library run on an NVIDIA GPU with that preset; what is established is below.
+The lighter network is checked against NVIDIA's own 310.9.16 output of it: the reference pictures of
+[DLSSNR-AMD](https://github.com/mochizuki0323/DLSSNR-AMD) (`docs/ngx-verification/310.9.16`, the library run on an
+RTX 5090 through NGX with its default preset, on the same three Tomb Raider frames). Its own GPU implementation
+scores 49.2, 49.4 and 50.6 dB against them.
 
 - The weights, the layer families, every record's size and the packing are read from the library.
-- The wiring is not stored as data: the library builds the network in code. It is the original's rules at the smaller
-  depth: the U-Net skips pair each upsample with its level's downsample, the bottleneck skip is the pooled split block,
-  and the window shifts cycle through (0,0), (-1,-1), (-1,0), (0,-1) with each encoder level starting over and each
-  decoder level continuing where its encoder level stopped. `scripts/small_shift_probe.py` scores the alternatives:
-  the shifts matter (no shifts at all costs 5.8 and 4.7 dB against NVIDIA's output, unshifted split blocks 1.3 and
-  3.4 dB), and the rule above is the best of the variants tried, but the differences between decoder offsets are
-  0.1 to 0.2 dB, so that part is the inference least supported by the measurements.
-- Its edit correlates 0.93, 0.90 and 0.91 with the original's at 1080p, 1440p and 4K, and it runs 1.9 times faster;
-  the int4 mixed network is calibrated on the original and refuses the lighter one.
+- The wiring is not stored as data (the library builds the network in code), so it is the original's rules at the
+  smaller depth, and the NVIDIA pictures confirm it: the U-Net skips pair each upsample with its level's downsample,
+  the bottleneck skip is the pooled split block, and the window shifts cycle through (0,0), (-1,-1), (-1,0), (0,-1)
+  with each encoder level starting over and each decoder level, and the decoder's split blocks, continuing where
+  their encoder side stopped. `scripts/small_shift_probe.py` scores the alternatives against NVIDIA's output: no
+  shifts at all costs 18 dB at 1080p, unshifted split blocks 8 dB, a decoder level starting at another offset
+  1.7 to 3.7 dB, and restarting the decoder's split blocks 0.4 dB (the same ordering at 1440p and 4K).
+- The working extent differs from the original's for this network: an axis aligns to 128 instead of 64 where the pre
+  block's output along it, `up((n + 1) / 2, 4)`, is 4 mod 8, so 1080 pads to 1152 rows, not 1088 (rule found by
+  DLSSNR-AMD, measured against the library). Without it the 1080p picture is 45.5 dB from NVIDIA's, with it 49.5.
+- Its edit is weaker than the original's: NVIDIA's output of it is closer to the input frame (28.9 dB at 1080p)
+  than the original's is (26.4 dB). It runs 1.9 to 2.0 times faster here; NVIDIA measures 1.7 to 1.8 times on an
+  RTX 5090.
+- The int4 mixed network is calibrated on the original and refuses the lighter one.
 
 ## Running it
 
@@ -230,7 +238,7 @@ baked into the exponent.
   stays on the reference arithmetic.
 - The layouts of the weight file were worked out from the library by inspection; a version of
   `nvngx_dlssnr.dll` whose records have other sizes stops the extractor with an error. 310.9.16.0 extracts, both
-  networks. The lighter network's wiring is inferred, not read (see above).
+  networks.
 
 The code is under the MIT license (see `LICENSE`); the network's weights are NVIDIA's and are not covered by it.
 

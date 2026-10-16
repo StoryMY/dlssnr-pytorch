@@ -1,10 +1,12 @@
 """Which window-shift pattern does the small network use? The library builds the network in code, so the pattern is
-not in the weights; a wrong one should match NVIDIA's output (made by the original network) worse than the right one.
+not in the weights; a wrong one should match NVIDIA's output worse than the right one.
 
-    python scripts/small_shift_probe.py --weights weights-small.safetensors [--sizes 1920x1080 2560x1440]
+    python scripts/small_shift_probe.py --weights weights-small.safetensors --inputs DIR --references DIR [--sizes ...]
 
-Each hypothesis replaces the shifts of the small plan and scores the three verification frames (PSNR against NVIDIA's
-output, and the correlation of the edit the network makes with NVIDIA's edit).
+``--inputs`` holds ``<size>.png`` (the verification frames) and ``--references`` ``<size>_nvidia.png``: NVIDIA's
+310.9.16 output of the new model, from DLSSNR-AMD's ``docs/ngx-verification/310.9.16/single-frame-outputs`` (the inputs
+are in its ``310.8.0/single-frame-inputs``). Each hypothesis replaces the shifts of the small plan and scores the
+frames (PSNR against NVIDIA's output, and the correlation of the edit the network makes with NVIDIA's edit).
 """
 import argparse
 from pathlib import Path
@@ -21,7 +23,8 @@ from dlssnr.weights import Weights
 CYCLE = plan_module._SHIFT_CYCLE
 p = argparse.ArgumentParser()
 p.add_argument("--weights", required=True)
-p.add_argument("--verification", default=str(Path(__file__).resolve().parents[2] / "DLSSNR-AMD" / "docs" / "ngx-verification"))
+p.add_argument("--inputs", required=True)
+p.add_argument("--references", required=True)
 p.add_argument("--sizes", nargs="+", default=["1920x1080"])
 args = p.parse_args()
 
@@ -62,14 +65,13 @@ HYPOTHESES = {
 
 device = resolve_device("auto")
 weights = Weights.load(args.weights)
-folder = Path(args.verification)
 print(f"{'hypothesis':70s}" + "".join(f"{s:>22s}" for s in args.sizes))
 for name, rows in HYPOTHESES.items():
     plan_module.ROWS["small"] = rows
     cells = []
     for size in args.sizes:
-        frame = load_image(folder / "single-frame-inputs" / f"{size}.png")
-        nvidia = load_image(folder / "single-frame-outputs" / f"{size}_nvidia.png")
+        frame = load_image(Path(args.inputs) / f"{size}.png")
+        nvidia = load_image(Path(args.references) / f"{size}_nvidia.png")
         out = NRNet(weights, frame.shape[1], frame.shape[0], network="small").to(device)(frame, Controls())
         correlation = np.corrcoef((out.astype(float) - frame).ravel(), (nvidia.astype(float) - frame).ravel())[0, 1]
         cells.append(f"{psnr(out, nvidia):6.2f} dB, corr {correlation:.4f}")

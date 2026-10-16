@@ -94,7 +94,7 @@ def stage_times(net, frame: np.ndarray, controls, repeats: int = 5) -> list[tupl
     from .layers.swin import swin_core
 
     device = net.device
-    image = frame_to_tensor(frame, device)
+    image = frame_to_tensor(frame, device, net.network)
     outputs = net.run(image, controls, capture=True)
     pre, post = net.layers[0], net.layers[-1]
     last = len(net.plan) - 1
@@ -107,7 +107,7 @@ def stage_times(net, frame: np.ndarray, controls, repeats: int = 5) -> list[tupl
     result = compose(image, residual, controls.intensity)
     height, width = frame.shape[:2]
     steps: list[tuple[str, Callable[[], object]]] = [
-        ("frame to tensor", lambda: frame_to_tensor(frame, device)),
+        ("frame to tensor", lambda: frame_to_tensor(frame, device, net.network)),
         ("pre-block features (noise, colour, controls)", lambda: pre.features(image)),
         ("pre-block lift", lambda: torch.einsum("ck,bkhw->bchw", pre.lift, features)),
         ("post-block blend", lambda: post.blend(main, skip)),

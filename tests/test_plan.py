@@ -85,7 +85,7 @@ def test_the_small_network_has_the_extracted_records(size):
     assert len(plan) == 76 and plan[0].block == 0 and plan[-1].block == 30
     assert [s.block for s in plan] == sorted(s.block for s in plan)
     assert {s.kind for s in plan} <= set(KINDS.values())
-    assert padding(*size, "small") == padding(*size)
+    assert padding(*size, "small").width == padding(*size).width     # only the height of 1080 aligns differently
 
 
 def test_the_small_network_is_shallower_in_the_same_levels():
@@ -103,3 +103,12 @@ def test_the_small_network_is_shallower_in_the_same_levels():
 def test_an_unknown_network_is_refused():
     with pytest.raises(KeyError):
         build_plan(1920, 1080, "huge")
+
+
+def test_the_small_network_aligns_an_axis_to_twice_where_the_pre_block_output_is_4_mod_8():
+    """Measured against NVIDIA's 310.9.16: 1080 pads to 1152 for the new model, not 1088; the original keeps 1088."""
+    assert padding(1920, 1080, "small")[:2] == (1920, 1152) and padding(1920, 1080)[:2] == (1920, 1088)
+    assert working_extent(1920, 1080, "small") == (1920, 1152)
+    for size in ((2560, 1440), (3840, 2160), (1366, 768), (1280, 720)):       # pre-block outputs 0 mod 8: unchanged
+        assert padding(*size, "small") == padding(*size)
+    assert padding(1080, 1920, "small")[:2] == (1152, 1920)                    # the rule is per axis

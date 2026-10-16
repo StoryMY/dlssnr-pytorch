@@ -124,7 +124,7 @@ class NRNet(nn.Module):
         controls = controls if controls is not None else Controls()
         if frame.shape[:2] != (self.height, self.width):
             raise ValueError(f"network built for {self.width}x{self.height}, got {frame.shape[1]}x{frame.shape[0]}")
-        image = frame_to_tensor(frame, self.device)
+        image = frame_to_tensor(frame, self.device, self.network)
         outputs = self.run(image, controls, capture)
         result = tensor_to_frame(_main(outputs[len(self.plan) - 1]), self.width, self.height)
         return (result, outputs) if capture else result
