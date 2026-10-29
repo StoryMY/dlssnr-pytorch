@@ -16,6 +16,13 @@ import time
 DEFAULT_WEIGHTS = os.environ.get("DLSSNR_WEIGHTS", "weights.safetensors")
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def _controls(args):
     from .io import Controls
 
@@ -63,8 +70,14 @@ def _enhance(args, frame):
     net = NRNet(weights, width, height).to(device)
     print(f"network built for {width}x{height} on {label} in {time.time() - started:.1f} s", file=sys.stderr)
     started = time.time()
+    controls = _controls(args)
+    passes = getattr(args, "passes", 1)
+    out = frame
     with torch.no_grad():
-        out = net(frame, _controls(args))
+        for index in range(passes):
+            out = net(out, controls)
+            if passes > 1:
+                print(f"pass {index + 1}/{passes} complete", file=sys.stderr)
     print(f"enhanced in {time.time() - started:.1f} s on {label}", file=sys.stderr)
     return out
 
@@ -191,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run", help="enhance an image")
     r.add_argument("image")
     r.add_argument("-o", "--output")
+    r.add_argument("--pass", dest="passes", type=_positive_int, default=1,
+                   help="enhancement passes, feeding each output into the next pass (default: 1)")
     r.add_argument("--side-by-side", action="store_true", help="write the input and the result next to each other")
     common(r)
     r.set_defaults(func=cmd_run)

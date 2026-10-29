@@ -8,6 +8,7 @@ __pycache__/
 *.safetensors
 *.pt
 *.bin
+*.png
 nvngx*
 streamline*
 out/
